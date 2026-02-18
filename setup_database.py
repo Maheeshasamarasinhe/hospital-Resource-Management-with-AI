@@ -12,17 +12,18 @@ Tables:
 
 import csv
 import sys
+import os
 
 try:
-    import mysql.connector
+    import pymysql
 except ImportError:
-    print("[ERROR] mysql-connector-python not installed.")
-    print("  Run:  pip install mysql-connector-python")
+    print("[ERROR] pymysql not installed.")
+    print("  Run:  pip install pymysql")
     sys.exit(1)
 
 # ─── Connection Config ─────────────────────────────────────────────────────────
 DB_CONFIG = {
-    "host":     "localhost",
+    "host":     "127.0.0.1",
     "user":     "root",
     "password": "",          # XAMPP default: no password
 }
@@ -128,17 +129,25 @@ def main():
 
     # Connect without DB first to create it
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-    except mysql.connector.Error as e:
+        conn = pymysql.connect(**DB_CONFIG)
+    except pymysql.Error as e:
         print(f"[ERROR] Cannot connect to MySQL: {e}")
         sys.exit(1)
 
     cursor = conn.cursor()
 
-    # Create database
+    # --- Force-delete the physical MariaDB data directory to clear orphaned .ibd files ---
+    import shutil
+    mariadb_db_dir = r"C:\xampp\mysql\data\hospital_db"
+    if os.path.exists(mariadb_db_dir):
+        shutil.rmtree(mariadb_db_dir, ignore_errors=True)
+        print(f"[OK]  Deleted orphaned data directory: {mariadb_db_dir}")
+
+    # Now safely drop and recreate
+    cursor.execute(f"DROP DATABASE IF EXISTS `{DATABASE}`;")
     cursor.execute(CREATE_DB)
     cursor.execute(f"USE `{DATABASE}`;")
-    print(f"[OK]  Database '{DATABASE}' ready.")
+    print(f"[OK]  Database '{DATABASE}' recreated (tablespace cleared).")
 
     # Create tables
     for ddl, name in [
