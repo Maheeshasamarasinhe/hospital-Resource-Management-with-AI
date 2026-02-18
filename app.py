@@ -7,7 +7,7 @@ import joblib
 import numpy as np
 import json
 import math
-import mysql.connector
+import pymysql
 
 app = Flask(__name__)
 CORS(app)
@@ -18,14 +18,31 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ===== MYSQL CONFIG =====
 DB_CONFIG = {
-    "host":     "localhost",
+    "host":     "127.0.0.1",
+    "port":     3306,          # Change to 3307 if XAMPP uses that port
     "user":     "root",
     "password": "",
     "database": "hospital_db",
 }
 
 def get_db():
-    return mysql.connector.connect(**DB_CONFIG)
+    return pymysql.connect(**DB_CONFIG, cursorclass=pymysql.cursors.DictCursor)
+
+# Test database connection at startup
+def test_db_connection():
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        print("✅ Database connected successfully!")
+        return True
+    except Exception as e:
+        print(f"❌ Database connection failed: {e}")
+        print("   → Predictions will still work but historical data fetch will be unavailable.")
+        return False
 
 # ===== CUSTOM ATTENTION LAYER (Required for model loading) =====
 class AttentionLayer(layers.Layer):
@@ -83,6 +100,9 @@ try:
 except Exception as e:
     print(f"❌ Error loading assets: {e}")
     model = None
+
+# Test database connection at startup
+test_db_connection()
 
 
 target_cols = ['Dengue', 'Road_Accidents', 'Heart_Patients', 'Hadisi_Anthuru', 'Tuberculosis', 'Cold', 'Fever']
@@ -177,7 +197,7 @@ def history():
         return jsonify({"error": "Provide month as integer 1-12"}), 400
     try:
         conn   = get_db()
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor()
         cursor.execute("""
             SELECT
                 AVG(dc.dengue)         AS Dengue,
@@ -226,7 +246,7 @@ def predict_frontend():
 
         # ----------- Fetch last 12 months from DB -----------
         conn   = get_db()
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor()
         cursor.execute("""
             SELECT
                 dc.dengue, dc.road_accidents, dc.heart_patients,
@@ -273,5 +293,5 @@ def predict_frontend():
 
 
 if __name__ == '__main__':
-   
-    app.run(debug=True, port=5000)
+    test_db_connection()
+    app.run(debug=True, host='0.0.0.0', port=5000)
