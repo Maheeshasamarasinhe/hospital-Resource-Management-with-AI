@@ -6,9 +6,26 @@ from tensorflow.keras import layers
 import joblib
 import numpy as np
 import json
+import math
+import mysql.connector
 
 app = Flask(__name__)
 CORS(app)
+
+# ===== BASE DIR =====
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ===== MYSQL CONFIG =====
+DB_CONFIG = {
+    "host":     "localhost",
+    "user":     "root",
+    "password": "",
+    "database": "hospital_db",
+}
+
+def get_db():
+    return mysql.connector.connect(**DB_CONFIG)
 
 # ===== CUSTOM ATTENTION LAYER (Required for model loading) =====
 class AttentionLayer(layers.Layer):
@@ -44,19 +61,19 @@ try:
     
     # Try loading .keras format first, fallback to .h5
     try:
-        model = tf.keras.models.load_model('hospital_multi_output_model.keras', 
+        model = tf.keras.models.load_model(os.path.join(BASE_DIR, 'hospital_multi_output_model.keras'), 
                                             custom_objects=custom_objects, compile=False)
     except:
-        model = tf.keras.models.load_model('hospital_multi_output_model.h5', 
+        model = tf.keras.models.load_model(os.path.join(BASE_DIR, 'hospital_multi_output_model.h5'), 
                                             custom_objects=custom_objects, compile=False)
     
-    scaler_seq = joblib.load('scaler_seq.joblib')
-    scaler_static = joblib.load('scaler_static.joblib')
-    scaler_target = joblib.load('scaler_target.joblib')
+    scaler_seq    = joblib.load(os.path.join(BASE_DIR, 'scaler_seq.joblib'))
+    scaler_static = joblib.load(os.path.join(BASE_DIR, 'scaler_static.joblib'))
+    scaler_target = joblib.load(os.path.join(BASE_DIR, 'scaler_target.joblib'))
     
     # Load metadata if available
     try:
-        with open('model_metadata.json', 'r') as f:
+        with open(os.path.join(BASE_DIR, 'model_metadata.json'), 'r') as f:
             model_metadata = json.load(f)
         print(f"Model loaded: {model_metadata.get('model_name', 'Unknown')} v{model_metadata.get('version', '?')}")
     except:
@@ -151,6 +168,109 @@ def model_info():
         "window_size": 12,
         "metadata": model_metadata
     })
+
+@app.route('/history', methods=['GET'])
+def history():
+    """Return average case counts for the requested month across all years."""
+    month = request.args.get('month', type=int)
+    if not month or not (1 <= month <= 12):
+        return jsonify({"error": "Provide month as integer 1-12"}), 400
+    try:
+        conn   = get_db()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT
+                AVG(dc.dengue)         AS Dengue,
+                AVG(dc.road_accidents) AS Road_Accidents,
+                AVG(dc.heart_patients) AS Heart_Patients,
+                AVG(dc.hadisi_anthuru) AS Hadisi_Anthuru,
+                AVG(dc.tuberculosis)   AS Tuberculosis,
+                AVG(dc.cold)           AS Cold,
+                AVG(dc.fever)          AS Fever
+            FROM disease_cases dc
+            JOIN time_periods   tp ON tp.id = dc.period_id
+            WHERE tp.month = %s
+        """, (month,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        # round values
+        avg_cases = {k: round(float(v), 1) if v else 0 for k, v in row.items()}
+        return jsonify({"month": month, "avg_cases": avg_cases})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/predict-frontend', methods=['POST'])
+def predict_frontend():
+    """
+    Simplified endpoint for the React frontend.
+    Accepts high-level inputs, fetches last 12 months from DB,
+    builds the sequential window and runs the model.
+    """
+    try:
+        if model is None:
+            return jsonify({"error": "Model not loaded"}), 500
+
+        data        = request.get_json()
+        month       = int(data['month'])
+        humidity    = float(data['humidity'])
+        rainfall    = float(data['rainfall'])
+        temperature = float(data['temperature'])
+        festive     = int(data['festive'])
+        awareness   = float(data['awareness'])
+
+        # Cyclical month encoding
+        month_sin = math.sin(2 * math.pi * month / 12)
+        month_cos = math.cos(2 * math.pi * month / 12)
+
+        # ----------- Fetch last 12 months from DB -----------
+        conn   = get_db()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT
+                dc.dengue, dc.road_accidents, dc.heart_patients,
+                dc.hadisi_anthuru, dc.tuberculosis, dc.cold, dc.fever,
+                ef.rainfall, ef.avg_temperature, ef.humidity
+            FROM disease_cases dc
+            JOIN time_periods          tp ON tp.id = dc.period_id
+            JOIN environmental_factors ef ON ef.period_id = tp.id
+            ORDER BY tp.date DESC
+            LIMIT 12
+        """)
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        if len(rows) < 12:
+            return jsonify({"error": f"Not enough historical data in DB. Found {len(rows)} rows, need 12."}), 400
+
+        rows.reverse()   # chronological order
+        seq_cols_order = ['dengue','road_accidents','heart_patients','hadisi_anthuru',
+                          'tuberculosis','cold','fever','rainfall','avg_temperature','humidity']
+        raw_seq    = np.array([[row[c] for c in seq_cols_order] for row in rows], dtype=float)
+        raw_static = np.array([[month_sin, month_cos, festive, 0, awareness]], dtype=float)
+        # note: Public_Holidays not in form → default 0
+
+        scaled_seq    = scaler_seq.transform(raw_seq).reshape(1, 12, 10)
+        scaled_static = scaler_static.transform(raw_static)
+
+        pred_scaled = model.predict([scaled_seq, scaled_static], verbose=0)
+        pred_final  = scaler_target.inverse_transform(pred_scaled)[0]
+
+        results = {d: max(0, int(round(v))) for d, v in zip(target_cols, pred_final)}
+        total   = sum(results.values())
+
+        return jsonify({
+            "status":                "success",
+            "predictions":           results,
+            "total_expected_patients": total,
+            "recommendation":        get_resource_recommendation(results),
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 
 if __name__ == '__main__':
    
